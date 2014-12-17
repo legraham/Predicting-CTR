@@ -1,0 +1,424 @@
+---
+output: pdf_document
+---
+Final Project: Predicting the Success of PPC Advertising
+Lauren Graham
+HOD 2790
+Data Science
+Professor Doyle
+*Please note that all data sets and maps/graphs mentioned in this project are include in the final project folder as well*
+
+The premise of this project is to predict whether there are any social factors that predict the success of pay-per-click advertising. Pay-per-click advertising is the ads embedded within search engines that often look like search results. If you Google "cute shoes", you will receive a search results page with links to websites that sell "cute shoes". Above these results (and in the right side bar) there is text that looks like a search result, but is denoted with a yellow icon that says "ad". These are pay-per-click ads. Advertisers place bids to secure these coveted spots at the top of the search results page. We know that people click on ads at nearly double the rate of organic searches (http://www.wordstream.com/blog/ws/2012/07/17/google-advertising), but who is clicking on these ads? I have set out to see if we can predict the success of ppc advertising based on the demographic components of a certain area. 
+
+First, we need to choose a metric to measure success. While there are dozens (perhaps hundreds) of ways to quantify ppc advertising success, there are two main metrics that most experts agree to be good success predictors for online advertising: click through rates and conversion rates. Click through rate is the amount of clicks an ad gets over the number of impressions. Conversion rate is the amount of conversions an ad prompts (which can be anything from making a purchase, to downloading a pdf, to signing up for a newsletter) divided by the number of clicks. For this project, we will be using click through rates as our success metric. This decision was made based on nature of the data available for the project. There were very few conversions in the data set used, thus using conversion rate as a success metric would not provide an analysis representative of the sample.
+
+Next, we need to explore the origin of the data used in this project. I was provide a Google AdWords data set from an internet company whose target customers are college students across the country. I organized this data set by ad campaign by geographic location. Google AdWords processes geographic location by identifying the most specific geographic location possible. This can be a zip code, a city, a metro area, or even in some cases, a university. Because the geographic locations were not standardize I needed a way to standardize them. I wanted to match this data set to the QuickFacts data, which provides demographic data based on fips codes. In order to match the two data sets, I edited both of the data sets until they matched on county codes. Below, I have loaded the libraries and the AdWords data set. 
+```{r}
+library(ggplot2)
+library(ggthemes)
+library(XML)
+library(chron)
+library(lubridate)
+library(acs)
+library(RCurl)
+library(gridExtra)
+library(maptools)
+library(ggmap)
+library(plyr)
+library(AUC)
+
+by.geo<-read.table(file="~/Desktop/datasci/AWGeography.csv",
+                   sep = ",",
+                   quote = "", 
+                   row.names = NULL, 
+                   stringsAsFactors = FALSE,
+                   fill=TRUE
+)
+save(by.geo,file="by.geo.Rdata")
+
+```
+Next, I cleaned up the AdWords data. I eliminated all ad campaigns that did not have a city or country specified. I would have been impossible to identify a county without these fields.
+```{r}
+by.geo<-by.geo[-(c(1)),-(c(6,13,14,15,16))]
+
+colnames(by.geo)<-c("country","state","metro","city","zip","clicks","impr","ctr","avg cpc","cost","avg pos")
+
+
+by.geo2<-by.geo[by.geo$city!="Unspecified", ]
+
+by.geo2<-by.geo2[by.geo2$country!=0,]
+
+city.only<-by.geo2
+save(city.only,file="city.only.Rdata")
+```
+I then used a data set from class which had zip codes, counties, and cities for the entire US. I used this to match cities from the AdWords data to their respective county. It is important to note that counties and cities overlap: there are many counties that host multiple cities or towns. This required quite a bit of editing of regular expressions to get the counties to match. I also went ahead and eliminated counties that had zero clicks because they would be unhelpful to the analysis.
+```{r}
+load(file="~/Documents/github/class/webscrape/zipCityCountyStateMap.Rda")
+names(zipMap2)<-c("state","county","zip","city_name","countyname","statename")
+
+zipMap2<-zipMap2[,-(c(1,2,3))]
+names(zipMap2)<-c("city","county","state")
+city.only<-city.only[,-(c(1,3,5))]
+
+zipMap2$city.state<-paste(as.character(zipMap2$city),as.character(zipMap2$state))
+city.only$city.state<-paste(as.character(city.only$city),as.character(city.only$state))
+
+zipMap2<-subset(zipMap2,!duplicated(zipMap2$city.state))
+new.var<-gsub("\\s", "" ,city.only$city.state)
+new.var<-tolower(new.var)
+new.var2<-gsub("\\s","",zipMap2$city.state)
+new.var2<-tolower(new.var2)
+city.only$city.state<-new.var
+zipMap2$city.state<-new.var2
+city.county<-join(zipMap2 , city.only , by = "city.state")
+city.county<-city.county[city.county$clicks!="0", ]
+city.county<-city.county[city.county$clicks!="NA", ]
+city.county<-na.omit(city.county)
+city.county<-city.county[,-(c(1,3,4,5,6))]
+names(city.county)<-c("county", "clicks", "impr","ctr", "cpc","cost","pos")
+```
+At this point, I was faced with a unique problem. I had all the cities matched on county, but counties were duplicated throughout the data set. In order to compress the data set so that counties were not repeated, I had to decide how to handle the numerical data, which includes clicks, click through rate, impressions, cost per click, total cost, and position. The solution was to take the sum of clicks and impressions, while taking the averages of the other variables. 
+```{r}
+city.county2<-ddply(city.county,.(county),summarize,
+                    click.sum=sum(as.numeric(clicks)),
+                    ctr.avg=mean(as.numeric(ctr),na.rm=TRUE),
+                    impr.sum=sum(as.numeric(impr)),
+                    cpc.avg=mean(as.numeric(cpc), na.rm=TRUE),
+                    cost.avg=mean(as.numeric(cost), na.rm=TRUE),
+                    pos.avg=mean(as.numeric(pos), na.rm = TRUE)
+)
+
+```
+
+Then, the QuickFacts data and labels were loaded in. 
+```{r}
+if (file.exists("quickfacts.RData")){
+  load("quickfacts.Rdata") 
+}else{
+  #If data's not in memory, then download and open
+  qf<-read.csv("http://quickfacts.census.gov/qfd/download/DataSet.txt",
+               colClasses=(fips="character"))
+  names(qf)<-c("fips",
+               "pop2013",
+               "pop2010_base",
+               "popchange_pc",
+               "pop2010",
+               "popu5",
+               "popu18",
+               "pop65p",
+               "female_pc",
+               "white_pc",
+               "black_pc",
+               "am_ind_pc",
+               "asian_pc",
+               "hawaii_pi_pc",
+               "twomore_race_pc",
+               "hispanic_pc",
+               "white_non_hispanic_pc",
+               "same_house_pc",
+               "foreign_born_pc",
+               "other_eng_home_pc",
+               "hs_grad_pc",
+               "coll_grad_pc",
+               "veterans",
+               "travel_time",
+               "housing_units",
+               "homeown_rate",
+               "house_unit_multi",
+               "median_home_val",
+               "households",
+               "person_per_hh",
+               "per_capita_inc",
+               "median_hh_inc",
+               "persons_below_poverty",
+               "pv_nonfarm",
+               "pv_nonfarm_employ",
+               "pv_nonfarm_employ_ch",
+               "nonemployer_est",
+               "firms",
+               "firms_black_own_pc",
+               "firms_amind_own_pc",
+               "firms_asian_own_pc",
+               "firms_hawaii_pi_own_pc",
+               "firms_hispanic_own_pc",
+               "firms_female_own_pc",
+               "manufacture_ship",
+               "wholesale",
+               "retail",
+               "retail_percap",
+               "hospitality",
+               "bldg_permits",
+               "land_area",
+               "pop_per_square"
+  )
+  
+  save(qf,file="quickfacts.Rdata")
+}
+
+
+
+var.labels<-read.fwf("http://quickfacts.census.gov/qfd/download/DataDict.txt",
+                     skip=2,
+                     widths=c(9,
+                              -1,
+                              88,
+                              48),
+                     strip.white=TRUE)
+
+# Codebook for variable names                                  
+labels.explain<-data.frame(names(qf)[-1],var.labels[,2])   
+
+save(labels.explain,file="labels_explain.RData")
+```
+To give an overview of the click through rates for the data set, I wanted to create a map that showed the areas with the highest concentrations of click through rates. To do this, a shapefile had to be created that matched on county.
+```{r}
+county_map2<-map_data("county")
+
+```
+The AdWords data set needed more editing to be able to match to the shapefile. The first issue is that not every state has counties, and these states were causing issues for the data merge between AdWords and the shapefile. My solution, while perhaps unorthodox, was to change Louisiana's parishes and Alaska's municipalities and boroughs to be counties. To match, I also had to use a special capitalization function found via Stack Overflow.
+```{r}
+city.county2$county<- gsub( "Parish|Municipality|Borough" , "County" , city.county2$county)
+
+simpleCap <- function(x) {
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep="", collapse=" ")
+}
+county_map2$region<-sapply(county_map2$region, simpleCap)
+county_map2$subregion<-sapply(county_map2$subregion, simpleCap)
+county_map2$region<-state.abb[match(county_map2$region,state.name)]
+county_map2$county<-paste(as.character(county_map2$subregion),as.character(county_map2$region), sep = " County, ", collapse = NULL)
+
+#combine with shapefile
+mapdata2<-join(county_map2,city.county2,by="county")
+
+#Order is important
+mapdata2 <- mapdata2[order(-mapdata2$ctr.avg, -mapdata2$click.sum),]
+
+```
+Once the file was ready, I created a map from the data. To provide some perspective, this first map is the average number of clicks by county. It shows where the highest pay-per-click activity is occurring for the company.
+```{r}
+g1<-ggplot(mapdata2, aes(long, lat, group = group, fill =click.sum)) +
+  geom_polygon(colour = "white", size = 0.02) + 
+  geom_polygon(data = mapdata2, colour = "white", fill = NA)
+g1<-g1+scale_fill_gradient(low="red", high="purple",name="Sum of Clicks by County")
+g1
+```
+The 5 counties with the most clicks according to the map are: 
+New York County, NY
+Cook County, IL
+San Diego County, CA
+Fort Bend County, TX
+Delaware County, PA
+
+Next, I created a map that shows click through rate by county. Remember that this eliminates counties that have a click through rate of zero. There were also multiple counties that had click through rates over 1. This occurs when someone has saved a link from a ppc ad and click on the ad without receiving the impression (i.e. seeing the ad on the search engine). To avoid skewing the data, I also eliminated counties with click through rates over 100%.
+```{r}
+under.1<-mapdata2[mapdata2$ctr.avg < .1,]
+under.1<- under.1[order(-under.1$ctr.avg, -under.1$click.sum),]
+g2<-ggplot(under.1, aes(long, lat, group = group, fill =ctr.avg)) +
+  geom_polygon(colour = "white", size = 0.02) + 
+  geom_polygon(data = under.1, colour = "white", fill = NA)
+g2<-g2+scale_fill_gradient(low="red", high="purple",name="Average CTR by County")
+g2
+```
+As you can see, there are quite a few counties that have been eliminated by this map. This suggests some imperfections in the data if there are that many counties with click through rates over 100%. A click through rate over 100% should be a very rare occurrence. 
+
+Unfortunately, this map still cannot be considered a representative sample for most counties. There were many counties who only had 2 or 3 impressions. If 1 or 2 of those impressions clicked, it results in a click through rate over 50%. Thus, this cannot be considered a representative sample. After some research and toying with the numbers, I landed on using only counties with over 50 clicks because they exhibited a representative sample. I have also showed the results of using counties with over 25 clicks and counties with over 75 clicks to show that 50 is a rational number to choose. 
+```{r}
+over.25<-under.1[under.1$click.sum > 25,]
+over.25<- over.25[order(-over.25$ctr.avg, -over.25$click.sum),]
+g3<-ggplot(over.25, aes(long, lat, group = group, fill =ctr.avg)) +
+  geom_polygon(colour = "white", size = 0.02) + 
+  geom_polygon(data = over.25, colour = "white", fill = NA)
+g3<-g3+scale_fill_gradient(low="red", high="purple",name="Average CTR by County (Clicks over 25)")
+g3
+
+over.75<-under.1[under.1$click.sum > 75,]
+over.75<- over.75[order(-over.75$ctr.avg, -over.75$click.sum),]
+g4<-ggplot(over.75, aes(long, lat, group = group, fill =ctr.avg)) +
+  geom_polygon(colour = "white", size = 0.02) + 
+  geom_polygon(data = over.75, colour = "white", fill = NA)
+g4<-g4+scale_fill_gradient(low="red", high="purple",name="Average CTR by County (Clicks over 75)")
+g4
+
+over.50<-under.1[under.1$click.sum > 50,]
+over.50<- over.50[order(-over.50$ctr.avg, -over.50$click.sum),]
+g5<-ggplot(over.50, aes(long, lat, group = group, fill =ctr.avg)) +
+  geom_polygon(colour = "white", size = 0.02) + 
+  geom_polygon(data = over.75, colour = "white", fill = NA)
+g5<-g5+scale_fill_gradient(low="red", high="purple",name="Average CTR by County (Clicks over 50)")
+g5
+
+```
+Under the conditions that the click through rate is between 0 and 1, and the number of clicks is over 50, the top 5 counties are: 
+Berks County, PA,
+Johnson County, IA
+Canadian County, OK
+El Paso County, CO
+Jefferson County, AL
+
+The total number of counties in this category is 138 out of 3,144 total in the U.S.
+
+I next wanted to seek out the demographic predictors for click through rates using this data set of counties with more than 50 clicks. First, I chose 4 demographic categories to analyze: age, race, education, and socioeconomic status. Within these categories, I looked at 2 or 3 specific factors. I created scatter plots with trend lines to evaluate whether there was a correlation between the factors and click through rate for each county. I planned to use the factors with correlations in a model to see if a click through rate prediction can be made. 
+
+The first step is to join the AdWords data with the QuickFacts data. Again appeared the problem of matching regular expressions. To solve this, I created a code book to match the two sets. 
+```{r}
+codebook<-map_data("county")
+codebook$polyname<-paste(as.character(codebook$region),as.character(codebook$subregion), sep = ",", collapse = NULL)
+
+code2<-data.frame(codebook$polyname, county_map2$county)
+code2<-subset(code2,!duplicated(code2))
+colnames(code2)<-c("polyname","county")
+
+qf2<-qf
+qf2$fips<-as.numeric(as.character(qf2$fips))
+data(county.fips)
+qf2<-join(qf2,county.fips,by="fips",type="right")
+qf2$polyname<-as.character(qf2$polyname)
+qf.test<-qf2
+
+county.test<-mapdata2[,-c(1,2,3,4,5,6)]
+county.test<-subset(county.test,!duplicated(county.test))
+almost<-join(county.test,code2,by="county")
+qf.county<-join(almost,qf.test,by="polyname")
+
+county.test2<-over.50[,-c(1,2,3,4,5,6)]
+
+county.test2<-subset(county.test2,!duplicated(county.test2))
+almost2<-join(county.test2,code2,by="county")
+qf.county2<-join(almost2,qf.test,by="polyname")
+
+qf.county2[, c(10:60)] <- sapply(qf.county2[, c(10:60)], as.numeric)
+
+```
+Now that the data set is ready, we will go through the various scatter plots to determine if any correlations can be made.
+Starting with the category of age, I created scatter plots illustrating the correlation between click through rate and population under 18, and click through rate and population over 65. 
+```{r}
+p1<-ggplot(qf.county2, aes(x=popu18,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p1<-p1+ylab("Average CTR")+xlab("Population Under 18")
+p1
+p2<-ggplot(qf.county2, aes(x=pop65p,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p2<-p2+ylab("Average CTR")+xlab("Population Over 65")
+p2
+```
+As you can see, neither of these plots produces a correlation worth mentioning. Next, we will look at click through rates by race. The race factors used will be: percent of population Hispanic, percent of population African American, and percent of population Asian. 
+```{r}
+p3<-ggplot(qf.county2, aes(x=hispanic_pc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p3<-p3+ylab("Average CTR")+xlab("Percent Hispanic")
+p3
+p4<-ggplot(qf.county2, aes(x=black_pc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p4<-p4+ylab("Average CTR")+xlab("Percent African American")
+p4
+p5<-ggplot(qf.county2, aes(x=asian_pc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p5<-p5+ylab("Average CTR")+xlab("Percent Asian")
+p5
+
+```
+While percent Hispanic and percent Asian present no noticeable results, there is a noticeable correlation between percent African American and click through rates. Click through rate increases as percent of the population that is African American increases. This suggests that this factor could be a successful predictor if applied to a model (which we will explore later).
+
+The next category is education. We will look at percent of the population with a high school degree and percent of the population with a college degree compared to click through rate. 
+```{r}
+p6<-ggplot(qf.county2, aes(x=coll_grad_pc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p6<-p6+ylab("Average CTR")+xlab("% College Grad")
+p6
+p7<-ggplot(qf.county2, aes(x=hs_grad_pc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p7<-p7+ylab("Average CTR")+xlab("% High School Grad")
+p7
+```
+Unfortunately, neither comparison results in a correlation. 
+
+Lastly, we will look socioeconomic factors compared to click through rate. These include median home value and per capita income for each county.
+```{r}
+p8<-ggplot(qf.county2, aes(x=per_capita_inc,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p8<-p8+ylab("Average CTR")+xlab("Per Capita Income")
+p8
+p9<-ggplot(qf.county2, aes(x=median_home_val,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p9<-p9+ylab("Average CTR")+xlab("Median Home Value")
+p9
+```
+Whil neither of these factors shows a strong correlation, per capita income shows a slight correlation, thus it might be helpful to use in a model.
+
+The results from the QuickFacts data are pretty disappointing, as very few of these factors show any correlation to click through rate. Even though this is the case, I will attempt to run a model to see if any predictions can be made.
+```{r}
+mod1<-lm(ctr.avg~black_pc+ per_capita_inc,
+         data=qf.county2)
+
+summary(mod1)
+```
+First, in this model only percent African American is statistically significant and it is the lowest level of significance. Per capita income was not significant at all. This is already bad news for the model. We can also see issue in the model with regards to the r-squared value. A higher r-squared typically suggests the model explains most of the variability of the response data around its mean. This model produces an r-squared of just under 4%, which indicated that virtually none of the variability can be explain by the model. Thus, it is not worth it to make predictions with this model.
+
+I wanted to do one final analysis using a data set different than QuickFacts. Because the company is a company catered to college students, I speculated that their pay-per-click advertising would be aimed at targeting college students. I used a data set from IPEDS that listed all universities in the U.S. and their Fall 2013 enrollment numbers. To make the set more appropriate for the data, I subset it by only including 2 and 4 year institutions who mainly give baccalaureate degrees. After loading in the data, it required some cleaning up and some editing of regular expressions to get it ready to join with click through rates. I then joined the two data sets.
+
+```{r}
+univ<-read.table(file="~/Desktop/datasci/university.csv",
+                 sep = ",",
+                 quote = "",  
+                 stringsAsFactors = FALSE,
+                 fill=TRUE
+)
+colnames(univ)<-c("university","city","state","enrollment")
+
+univ<-univ[-(c(1)),]
+
+univ$city.state<-paste(as.character(univ$city),as.character(univ$state))
+new.var3<-gsub("\\s","",univ$city.state)
+new.var3<-tolower(new.var3)
+univ$city.state<-new.var3
+univ<-univ[,-(c(1,2,3))]
+
+univ2<-ddply(univ,.(city.state),summarize,
+                    enroll.sum=sum(as.numeric(enrollment))
+)
+
+univ2<-na.omit(univ2)
+
+univ.county<-join(univ2, zipMap2 , by = "city.state")
+univ.county<-univ.county[,-(c(3,5))]
+univ.county<-na.omit(univ.county)
+
+univ.qf<-join(qf.county2,univ.county, by = "county")
+univ.qf<-univ.qf[,c(1,3,62)]
+univ.qf <- univ.qf[order(-univ.qf$enroll.sum),]
+univ.qf<-ddply(univ.qf,.(county),summarize,
+                    enroll.sum=sum(as.numeric(enroll.sum)),
+                    ctr.avg=mean(as.numeric(ctr.avg),na.rm=TRUE)
+)
+
+univ.qf<-na.omit(univ.qf)
+
+```
+The next step was to create a scatter plot with a trend line to show whether there is a correlation between total enrollment numbers and click through rate by county.
+```{r}
+p10<-ggplot(univ.qf, aes(x=enroll.sum,y=ctr.avg))+
+  geom_point(shape=1)+ 
+  geom_smooth(method=lm, aes(group=1))
+p10<-p10+ylab("Average CTR")+xlab("Totall Fall 2013 Enrollment")
+p10
+```
+While this was a relationship worth testing, we unfortunately see virtually no correlation between enrollment numbers and click through rates. 
+
+It is disappointing that this project produced no significant predictors of click through rates for online ads. However, this speaks to the nature of pay-per-click advertising. During my summer spent working in web analytics, I heard many times how implementing online advertising is often more about guesswork than science. The first issue is that search engines sometimes process the data incorrectly. I saw this in the second map I created, where I had multiple counties with click through rates higher than 1%. This is most likely a reporting error on Google AdWords. Human implementation error can also affect the accuracy of the data. AdWords tracks all its metrics by having advertisers insert AdWords java code into their webpage code. If this is inserted incorrectly, AdWords maybe not process the data. The metric of ad rank is also not an exact science. Advertisers bid money for higher positions for their ppc ads, but the amount they bid is not the only determinate of their ad's rank on the search engine page. The bid is multiplied by "quality score", which is a metric whose formula is virtually unknown (except for the fact that it takes into account the number of clicks). Thus, even for seasoned advertisers, it is a matter of guessing and checking to get your ad to a coveted spot on the top of the page. 
+
+It is also important to note that conclusion of click through rates not being relational to social factors was determined using the data from one specific company. The outcome could have been different based on a different company's data. Thus, the outcomes of this analysis cannot be successfully applied to pay-per-click advertising as a whole until the analysis is run with other companies' data. 
+
+In summary, the biggest takeaway this project provides is that neither social factors nor college enrollment rates appear to be correlated to click through rates for pay-per-click advertising. The rationale behind this outcome boils down to a known fact about data analyses: a human behavior (such as clicking on an ad) is the most difficult outcome to predict.
+
+
